@@ -106,7 +106,7 @@ class KdTree(object):
 			else:
 				# find/determine split
 				bounds_in_node = bounds[:, N.tile(in_node,2)]
-				split = self.determine_split(minpoint, maxpoint, minpoints[:,in_node], maxpoints[:,in_node], bounds_in_node, n_bounds=n_bounds, t_trav=self.t_trav, t_isec=self.t_isec, empty_bonus=self.empty_bonus)
+				split = self.determine_split(minpoint, maxpoint, minpoints[:,in_node], maxpoints[:,in_node], bounds_in_node, n_bounds=n_bounds, t_trav=self.t_trav, t_isec=self.t_isec, empty_bonus=self.empty_bonus, split_threshold=self.split_threshold)
 				if split[0] == 3:
 					# make parent node a leaf:
 					self.nodes[node_idx].flag = 3
@@ -145,7 +145,7 @@ class KdTree(object):
 		logging.log(self.loglevel, 'Kd-Tree built')
 
 
-	def determine_split(self, minpoint_parent, maxpoint_parent, minpoints, maxpoints, bounds, n_bounds=None, t_trav=1., t_isec=100., empty_bonus=0.2):
+	def determine_split(self, minpoint_parent, maxpoint_parent, minpoints, maxpoints, bounds, n_bounds=None, t_trav=1., t_isec=100., empty_bonus=0.2, split_threshold=None):
 		'''
 		Based on:
 		https://pbr-book.org/3ed-2018/Primitives_and_Intersection_Acceleration/Kd-Tree_Accelerator
@@ -199,8 +199,52 @@ class KdTree(object):
 					i+=1
 
 				if SAH_res is not None:
-					return int(a), bounds_axis[SAH_res]
+					# Adjust the split based on object count
+					if split_threshold is None:
+						return int(a), bounds_axis[SAH_res]
+					adjusted_split = self.adjust_split(bounds_axis[SAH_res], minpoint_parent, maxpoint_parent, minpoints, maxpoints, a, split_threshold)
+					return int(a), adjusted_split
 		return 3, Ns
+
+
+	def adjust_split(self, split, minpoint, maxpoint, minpoints, maxpoints, axis, threshold=0.1):
+		"""
+		Adjust the split position based on the count of objects within each node
+		to achieve an approximately equal count on both sides, if the difference exceeds the threshold.
+		"""
+		left_count = N.sum(maxpoints[axis] < split)
+		right_count = N.sum(minpoints[axis] > split)
+		total_count = left_count + right_count
+
+		# If total count is zero, no adjustment is needed
+		if total_count == 0:
+			return split
+
+		# Calculate the proportion of objects on each side
+		left_proportion = left_count / total_count
+		right_proportion = right_count / total_count
+
+		# If the difference in proportions is within the threshold, no adjustment is needed
+		if abs(left_proportion - right_proportion) <= threshold:
+			return split
+
+		# Calculate the desired number of objects on each side
+		desired_count = total_count / 2
+
+		# Iteratively adjust the split position to balance the counts
+		adjustment_step = (maxpoint[axis] - minpoint[axis]) * 0.01  # Step size for adjustment
+
+		while abs(left_count - right_count) > (threshold * total_count):  # Continue until the counts are approximately equal
+			if left_count > desired_count:
+				split += adjustment_step
+			else:
+				split -= adjustment_step
+			
+			left_count = N.sum(maxpoints[axis] < split)
+			right_count = N.sum(minpoints[axis] > split)
+
+		return split
+
 
 	def add_node(self, n, nodes_info):
 		for i in range(n):
