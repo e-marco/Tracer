@@ -13,7 +13,7 @@ from ray_trace_utils.vector_manipulations import get_angle, rotate_z_to_normal
 from tracer.spatial_geometry import rotz, general_axis_rotation
 from abc import ABC, abstractmethod
 from itertools import combinations
-from copy import copy
+from copy import deepcopy
 
 import sys, inspect
 
@@ -83,9 +83,9 @@ Optical manager lock to automaticlaly prevent issues with a single optical manag
 '''
 def copy_optical_manager(opt):
 	'''
-	To easily make copies of teh same setup for several objects
+	To easily make copies of the same setup for several objects
 	'''
-	newopt = copy(opt)
+	newopt = deepcopy(opt)
 	if hasattr(newopt, 'reset'):
 		newopt.reset()
 	return newopt
@@ -894,19 +894,16 @@ class LambertianAbsorbant(Lambertian, Absorbant):
 	'''
 	def __init__(self, absorptivity=0., attenuation_coefficient=0., ang_range=N.pi/2., scaling=1.):
 		self._absorptivity=absorptivity
-		Lambertian.__init__(self, absorptivity=1., ang_range=ang_range) # this makes differentiating between attenuationa nd absorption easier.
+		Lambertian.__init__(self, absorptivity=0., ang_range=ang_range) # this makes differentiating between attenuationa nd absorption easier.
 		Absorbant.__init__(self, attenuation_coefficient, scaling)
 
 	def __call__(self, geometry, rays, selector):
 		outg = Lambertian.__call__(self, geometry, rays, selector)
 		self.attenuate(rays, outg)
 		incident_ener = outg.get_energy()
-		self.attenuations = incident_ener - rays.get_energy()
+		self.attenuations = rays.get_energy(selector) - incident_ener
 		outg.set_energy(incident_ener*(1.-self._absorptivity))
 		return outg
-
-	def get_attenuations(self):
-		return self.attenuations
 
 class RefractiveAbsorbant(Refractive, Absorbant):
 	'''
@@ -1641,8 +1638,8 @@ class AbsorptionAccountant(Accountant):
 	def count(self, geometry, rays, selector, new_bundle):
 		ein = rays.get_energy(selector)
 		eout = new_bundle.get_energy()
-		if hasattr(self, 'get_attenuations'):
-			ein -= self.get_attenuations()
+		if hasattr(self, 'attenuations'):
+			ein -= self.attenuations
 		self._absorbed.append(ein - eout)
 
 	def get_data(self):
@@ -1670,8 +1667,8 @@ class AttenuationAccountant(Accountant):
 		"""Clear the memory of hits (best done before a new trace)."""
 		self._attenuated = []
 
-	def count(self, geometry, rays, selector, new_bundle):
-		self._attenuated.append(self.get_attenuations())
+	def count(self, geometry, rays, selector, new_bundle, attenuations):
+		self._attenuated.append(attenuations)
 
 	def get_data(self):
 		"""
@@ -1680,7 +1677,7 @@ class AttenuationAccountant(Accountant):
 		Returns:
 		the energy incident at each hit-point
 		"""
-		if not len(self._received):
+		if not len(self._attenuated):
 			return N.array([])
 
 		return N.hstack([a for a in self._attenuated if len(a)])
@@ -1951,8 +1948,16 @@ def make_mixed_accountant_class(name, accountants, optics_class):
 
 		def __call__(self, geometry, rays, selector):
 			new_bundle = OpticsCallable.__call__(self, geometry, rays, selector)
+			# check if we need an additional variable for the count function, used to pass through values from
+			# the OpticsCallable to the accountant
 			for a in self.accountants:
-				a.count(geometry, rays, selector, new_bundle)
+				kwargs = {'geometry': geometry, 'rays': rays, 'selector': selector, 'new_bundle': new_bundle}
+				vars = list(a.count.__code__.co_varnames[:a.count.__code__.co_argcount])
+				vars.remove('self')
+				for v in vars:
+					if v not in kwargs:
+						kwargs.update({v:eval('self._opt.'+v)})
+				a.count(**kwargs)
 			return new_bundle
 
 		def reset(self):
@@ -2038,12 +2043,14 @@ def make_polychromatic_accountant_class(name, parent):
 def make_accountant_classes(optical_class):
 	for accs in mixed_accountants:
 		names = [a().shorthand for a in accs]
-		accountant_name = ''.join(names[::-1])
+		accountant_name = ''.join(names)
 		newclass = optical_class.__name__ + accountant_name
 		make_mixed_accountant_class(newclass, accs, optical_class)
-		alias_check = [k for k in aliases.keys() if k in accountant_name]
+		alias_check = [k for k in aliases.keys() if all(ak in accountant_name for ak in aliases[k])]
 		for k in alias_check:
-			newclass_alias = newclass.replace(k, aliases[k])
+			for a in aliases[k]:
+				newclass = newclass.replace(a, '')
+			newclass_alias = newclass+k
 			make_mixed_accountant_class(newclass_alias, accs, optical_class)
 
 # Make all accountant combinations to then use in making the optics callable classes with accountant composition
@@ -2053,14 +2060,18 @@ def make_accountant_classes(optical_class):
 accountants_raw = Accountant.__subclasses__()
 accountants = []
 # TODO: decide this, split spectral and polychromatic, associate polychromatic with energy processing and change order decided so far.
-# Current order: accountants to respect get_all_hits() output convention: energy (absorbed or scattered), wavelengths or spectra, hits, directions
-# Within each category, do alphabetical
-accountant_types = ['Absorption', 'Attenuation', 'Reception', 'Scattering', 'Polychromatic', 'Spectral', 'Location', 'Direction', 'Normal']
+# Current order: accountants to respect get_all_hits() output convention: energy (absorbed, attenuated, received or scattered), wavelengths or spectra, hits, directions, normals
+ener_accs = ['Absorption', 'Attenuation', 'Reception', 'Scattering']
+spectral_acccs = ['Polychromatic', 'Spectral']
+location_accs = ['Location']
+directions_accs = ['Direction', 'Normal']
+accountant_types = [ener_accs, spectral_acccs, location_accs, directions_accs]
 for at in accountant_types:
-	accountants.extend([a for a in accountants_raw if at in a.__name__])
+	for a in at:
+		accountants.extend([ax for ax in accountants_raw if a in ax.__name__])
 # Aliases to make declaration easier for common accountants and ensure backward compatibility
-# TODO: DEal with repeats in aliases and output order
-aliases = {'LocationAbsorber':'Receiver', 'DirectionalLocationAbsorber':'Detector', 'LocationScatterer':'Transmitter'}
+# TODO: Deal with output order. mostly done but needs checking. Alias is always at the end in order of alias.
+aliases = {'Receiver':['Location', 'Absorber'], 'Detector':['Directional','Location','Absorber'], 'Transmitter':['Location','Scatterer']}
 mixed_accountants = []
 for i in range(1, len(accountants)):
 	mix = (list(tup) for tup in combinations(accountants, i))
